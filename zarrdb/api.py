@@ -4,17 +4,19 @@ import json
 import os
 
 import yarl
-import aiohttp
+import httpx
 import base64
 import logging
 
 from zarrdb.utils import zarrdata, app, logstream, nfiles
+from zarrdb.gather import Gatherer
 
 logger = logging.getLogger('zarrdb.' + __name__)
 logger.addHandler(logstream)
 logger.propagate = False
 
 session = None
+gather = None
 
 revision = '1.1'
 
@@ -29,11 +31,13 @@ def check_exists(zarr_ds) -> None:
 @app.on_event('startup')
 async def startup_event():
     global session
-    session = aiohttp.ClientSession()
+    session = httpx.AsyncClient()
+    global gather
+    gather = Gatherer(session)
 
 @app.on_event('shutdown')
 async def shutdown_event():
-    await session.close()
+    await session.aclose()
 
 @app.get('/')
 def read_root():
@@ -64,14 +68,16 @@ def read_zarr_meta(zarr_ds: str):
         refs = json.load(f)['refs']
         return {'metadata':refs}
 
-async def read_kerchunk_ref(url, kw):
-    async with session.get(url, **kw) as r:
-        out = await r.read()
-    return out
+# async def read_kerchunk_ref(url, kw):
+#     async with session.get(url, **kw) as r:
+#         out = await r.read()
+#     return out
 
 @app.get('/{zarr_ds}/{var}/{chunk_id}')
 async def read_zarr_data(zarr_ds: str, var: str, chunk_id: str):
     check_exists(zarr_ds)
+
+    request_id = f'{zarr_ds}/{var}/{chunk_id}'
     
     try:
         # Key-value mapping
@@ -91,17 +97,16 @@ async def read_zarr_data(zarr_ds: str, var: str, chunk_id: str):
             lim0 = int(chunk_refs['o'])
             lim1 = int(chunk_refs['o']) + int(chunk_refs['s'])
 
-            url = yarl.URL(
-                nfiles[
+            url = nfiles[
                     zarr_ds.replace('.zarr','.nfs')].find(
                         {'_id':chunk_refs['h']}
-                    )
-                [0]['h'])
+                    )[0]['h']
 
-            kw   = {'headers': {'Range': f'bytes={lim0}-{lim1-1}'}}
+            kw   = {'Range': f'bytes={lim0}-{lim1-1}', 'Keep-Alive': 'timeout=5, max=100'}
 
         # Able to request whole objects if needed
-        data = await read_kerchunk_ref(url, kw)
+        await gather.register(request_id, url, kw)
+        data = await gather.fetch(request_id)
 
         logger.info(var, chunk_id, kw)
 
