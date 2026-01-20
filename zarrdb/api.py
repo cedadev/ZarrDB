@@ -6,15 +6,25 @@ import os
 import yarl
 import aiohttp
 import base64
+import logging
 
-app = FastAPI()
-username = 'nraboy'
-password = 'password1234'
+from zarrdb.utils import zarrdata, app, logstream, nfiles
 
-dbclient = pymongo.MongoClient('mongodb://%s:%s@127.0.0.1' % (username, password))
-zarrdb = dbclient['zarr']
+logger = logging.getLogger('zarrdb.' + __name__)
+logger.addHandler(logstream)
+logger.propagate = False
 
 session = None
+
+revision = '1.1'
+
+def check_exists(zarr_ds) -> None:
+    zarr_datasets = zarrdata.list_collection_names()
+
+    zdb = zarr_ds.replace(f'z{revision}.zarr',f'zdb{revision}.json')
+
+    if zarr_ds not in zarr_datasets or not os.path.isfile(f'configs/zdb/{zdb}'):
+        raise HTTPException(status_code=404, detail='Zarr DS not found')
 
 @app.on_event('startup')
 async def startup_event():
@@ -27,41 +37,32 @@ async def shutdown_event():
 
 @app.get('/')
 def read_root():
-    return zarrdb.list_collection_names()
+    return zarrdata.list_collection_names()
 
 @app.get('/{zarr_ds}/.zgroup')
 def read_zarr_group(zarr_ds: str):
-    zarr_datasets = zarrdb.list_collection_names()
+    check_exists(zarr_ds)
 
-    zdb = zarr_ds.replace('z1.0.zarr','zdb1.0.json')
-
-    if zarr_ds not in zarr_datasets or not os.path.isfile(f'zarrdb/{zdb}'):
-        raise HTTPException(status_code=404, detail='Zarr DS not found')
-    
-    with open(f'zarrdb/{zdb}') as f:
+    zdb = zarr_ds.replace(f'z{revision}.zarr',f'zdb{revision}.json')
+    with open(f'configs/zdb/{zdb}') as f:
         return json.load(f)['refs']['.zgroup']
 
 @app.get('/{zarr_ds}/.zattrs')
 def read_zarr_attrs(zarr_ds: str):
-    zarr_datasets = zarrdb.list_collection_names()
-    zdb = zarr_ds.replace('z1.0.zarr','zdb1.0.json')
+    check_exists(zarr_ds)
 
-    if zarr_ds not in zarr_datasets or not os.path.isfile(f'zarrdb/{zdb}'):
-        raise HTTPException(status_code=404, detail='Zarr DS not found')
-   
-    with open(f'zarrdb/{zdb}') as f:
+    zdb = zarr_ds.replace(f'z{revision}.zarr',f'zdb{revision}.json')
+    with open(f'configs/zdb/{zdb}') as f:
         return json.load(f)['refs']['.zattrs']
 
 @app.get('/{zarr_ds}/.zmetadata')
 def read_zarr_meta(zarr_ds: str):
-    zarr_datasets = zarrdb.list_collection_names()
-    zdb = zarr_ds.replace('z1.0.zarr','zdb1.0.json')
+    check_exists(zarr_ds)
 
-    if zarr_ds not in zarr_datasets or not os.path.isfile(f'zarrdb/{zdb}'):
-        raise HTTPException(status_code=404, detail='Zarr DS not found')
-   
-    with open(f'zarrdb/{zdb}') as f:
-        return {'metadata':json.load(f)['refs']}
+    zdb = zarr_ds.replace(f'z{revision}.zarr',f'zdb{revision}.json')
+    with open(f'configs/zdb/{zdb}') as f:
+        refs = json.load(f)['refs']
+        return {'metadata':refs}
 
 async def read_kerchunk_ref(url, kw):
     async with session.get(url, **kw) as r:
@@ -70,31 +71,39 @@ async def read_kerchunk_ref(url, kw):
 
 @app.get('/{zarr_ds}/{var}/{chunk_id}')
 async def read_zarr_data(zarr_ds: str, var: str, chunk_id: str):
-    zarr_datasets = zarrdb.list_collection_names()
-    zdb = zarr_ds.replace('z1.0.zarr','zdb1.0.json')
-
-    if zarr_ds not in zarr_datasets or not os.path.isfile(f'zarrdb/{zdb}'):
-       raise HTTPException(status_code=404, detail='Zarr DS not found')
+    check_exists(zarr_ds)
     
     try:
-        chunk_refs = zarrdb[zarr_ds].find({"_id": f"{var}/{chunk_id}"})[0]
+        # Key-value mapping
+        chunk_refs = zarrdata[zarr_ds].find({"_id": f"{var}/{chunk_id}"})[0]
     except IndexError:
         raise HTTPException(status_code=404, detail=f'Chunk {var}/{chunk_id} unavailable')
     
-    if chunk_refs.get('data'):
-        data = base64.b64decode(chunk_refs['data'][7:])
-        print(var, chunk_id, 'b64')
+    if chunk_refs.get('d'):
+        data = base64.b64decode(chunk_refs['d'][7:])
+        logger.info(var, chunk_id, 'b64')
     else:
 
-        lim0 = int(chunk_refs['offset'])
-        lim1 = int(chunk_refs['offset']) + int(chunk_refs['size'])
-        url  = yarl.URL(chunk_refs['href'])
+        # Default no headers
+        kw = {}
+        if chunk_refs.get('o'):
 
-        kw = {'headers': {'Range': f'bytes={lim0}-{lim1-1}'}}
+            lim0 = int(chunk_refs['o'])
+            lim1 = int(chunk_refs['o']) + int(chunk_refs['s'])
 
+            url = yarl.URL(
+                nfiles[
+                    zarr_ds.replace('.zarr','.nfs')].find(
+                        {'_id':chunk_refs['h']}
+                    )
+                [0]['h'])
+
+            kw   = {'headers': {'Range': f'bytes={lim0}-{lim1-1}'}}
+
+        # Able to request whole objects if needed
         data = await read_kerchunk_ref(url, kw)
 
-        # Range-get object -> ? -> zarr data file.
-        print(var, chunk_id, kw)
-        print(data)
+        logger.info(var, chunk_id, kw)
+
+    # Data response - mimics Object Store requests
     return Response(content=data, media_type='application/octet-stream')
